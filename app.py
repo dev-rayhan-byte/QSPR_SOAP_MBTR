@@ -1,61 +1,84 @@
 """
-Streamlit Scientific Workstation
-QSPR + SOAP + MBTR + interactive 3D viewer + bond customization
-Author: Adapted for the user (2025)
+Ultimate Streamlit Scientific Workstation
+- Multi-file CIF handling
+- Global element/pair control + per-pair bond min/max
+- Full control board, coefficient editor, presets
+- QSPR + SOAP + MBTR integration
+- Polished 3D viewer (py3Dmol) with color map
+Author: Adapted for user (2025)
 """
 
 import os
 import io
+import json
 import math
 import tempfile
-from collections import defaultdict
+import zipfile
+from collections import defaultdict, OrderedDict
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from tqdm.auto import tqdm
 from sklearn.cluster import DBSCAN
-
+from tqdm.auto import tqdm
 from pymatgen.core import Structure
 from pymatgen.analysis.local_env import CrystalNN
 from pymatgen.core.periodic_table import Element
 from ase import Atoms
-
-# DScribe
 from dscribe.descriptors import SOAP, MBTR
-
-# 3D viewer helper: py3Dmol (provides HTML for the viewer)
 import py3Dmol
 
-# ------------------ Settings & defaults ------------------
-st.set_page_config(page_title="Scientific Workstation — QSPR + SOAP/MBTR", layout="wide")
+# ---------------- page config ----------------
+st.set_page_config(page_title="Scientific Workstation — Ultimate", layout="wide", initial_sidebar_state="expanded")
+st.markdown("<style>footer {visibility: hidden;} </style>", unsafe_allow_html=True)
+
+# ---------------- defaults ----------------
 BOND_LENGTH_FALLBACK = 3.2
 DEFAULT_DBSCAN_EPS = 0.25
 DEFAULT_DBSCAN_MIN_SAMPLES = 1
 DEFAULT_SOAP_N = 50
 
-COEFFICIENTS = {
-    'b0': 0.0000,
-    'b_Pt-S': -0.1225,
-    'b_Ru-S': 0.0000,
-    'b_Pt-Ru': 0.0050,
-    'b_Ru-Ru': -0.0160,
-    'b_Ru-Ru-': -0.1020,
-    'b_Pt-Pt': 0.0048,
-    'b_Pt-Pt-': 0.0550
+# Default coefficient map (editable by user)
+DEFAULT_COEFFICIENTS = OrderedDict([
+    ('b0', 0.0000),
+    ('b_Pt-S', -0.1225),
+    ('b_Ru-S', 0.0000),
+    ('b_Pt-Ru', 0.0050),
+    ('b_Ru-Ru', -0.0160),
+    ('b_Ru-Ru-', -0.1020),
+    ('b_Pt-Pt', 0.0048),
+    ('b_Pt-Pt-', 0.0550),
+])
+
+# quick element color map (extend as needed)
+ELEMENT_COLORS = {
+    "H": "#FFFFFF", "C": "#909090", "N": "#3050F8", "O": "#FF0D0D", "F": "#90E050",
+    "P": "#FF8000", "S": "#FFFF30", "Cl": "#1FF01F", "Pt": "#D0D0E0", "Ru": "#248F8F",
+    "Pd": "#A0C0D0", "Co": "#F090A0", "Fe": "#E06633", "Cu": "#C88033", "Ni": "#50D050",
+    "Au": "#FFD123", "Ag": "#C0C0C0", "Zn": "#7D80B0", "Sn": "#668080", "Pb": "#575961",
 }
 
+# initialize CrystalNN
 cnn = CrystalNN(weighted_cn=False)
 
-# ------------------ Helper functions ------------------
+# ---------------- helper funcs ----------------
 def adaptive_bond_cutoff(e1, e2, scale=1.25, fallback=BOND_LENGTH_FALLBACK):
+    """Adaptive cutoff using covalent radii, fallback if missing."""
     try:
         r1, r2 = Element(e1).covalent_radius, Element(e2).covalent_radius
-        if any(math.isnan(x) for x in [r1, r2]):
+        if any(x is None or (isinstance(x, float) and math.isnan(x)) for x in [r1, r2]):
             return fallback
         return scale * (r1 + r2)
     except Exception:
         return fallback
+
+def detect_layers(z_coords, eps=DEFAULT_DBSCAN_EPS, min_samples=DEFAULT_DBSCAN_MIN_SAMPLES):
+    z = np.array(z_coords).reshape(-1, 1)
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(z)
+    labels = clustering.labels_
+    unique = sorted(set(labels))
+    mapping = {lab: idx for idx, lab in enumerate(unique)}
+    return np.array([mapping[lab] for lab in labels])
 
 def find_neighbors_validated(structure, idx, max_check=128):
     neighbors_idx = set()
@@ -68,7 +91,6 @@ def find_neighbors_validated(structure, idx, max_check=128):
                 neighbors_idx.add(j)
     except Exception:
         pass
-
     if not neighbors_idx:
         for j, site in enumerate(structure.sites):
             if j == idx:
@@ -87,37 +109,66 @@ def structure_to_ase(structure):
     cell = structure.lattice.matrix
     return Atoms(symbols=symbols, positions=positions, cell=cell, pbc=True)
 
-def detect_layers(z_coords, eps=DEFAULT_DBSCAN_EPS, min_samples=DEFAULT_DBSCAN_MIN_SAMPLES):
-    z = np.array(z_coords).reshape(-1, 1)
-    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(z)
-    labels = clustering.labels_
-    unique = sorted(set(labels))
-    mapping = {lab: idx for idx, lab in enumerate(unique)}
-    return np.array([mapping[lab] for lab in labels])
-
 def propagate_uncertainty_linear(coeff_map, x_counts):
     sigma2 = 0.0
     for ck, b in coeff_map.items():
-        if ck == 'b0':
-            continue
+        if ck == 'b0': continue
         xkey = ck.replace('b_', '')
         if xkey in x_counts:
             N = max(x_counts[xkey], 0)
             sigma_x = math.sqrt(N)
-            sigma2 += (b * sigma_x) ** 2
+            sigma2 += (b * sigma_x)**2
     return math.sqrt(sigma2)
 
-# ------------------ Descriptor/analysis core ------------------
+# robust viewer builder using py3Dmol
+def make_py3dmol_view(structure: Structure, show_bonds=True, bond_min=0.0, bond_max=3.0,
+                      highlight_atom_index=None, show_poly=False, poly_neighbors=None,
+                      atom_size=0.45, style='sphere'):
+    coords = np.array([s.coords for s in structure.sites])
+    elements = [str(s.specie) for s in structure.sites]
+    view = py3Dmol.view(width=780, height=520)
+    # add atoms as spheres
+    for i, (el, pos) in enumerate(zip(elements, coords)):
+        color = ELEMENT_COLORS.get(el, ELEMENT_COLORS.get(el.capitalize(), '#AAAAAA'))
+        # sphere by adding a model with one atom - simpler approach
+        view.addSphere({'center': {'x': float(pos[0]), 'y': float(pos[1]), 'z': float(pos[2])},
+                        'radius': atom_size, 'color': color, 'opacity': 1.0})
+    # bonds (cylinders)
+    if show_bonds:
+        n = len(elements)
+        for i in range(n):
+            for j in range(i+1, n):
+                d = structure.get_distance(i, j)
+                if bond_min <= d <= bond_max:
+                    view.addCylinder({'start': {'x': float(coords[i,0]), 'y': float(coords[i,1]), 'z': float(coords[i,2])},
+                                      'end':   {'x': float(coords[j,0]), 'y': float(coords[j,1]), 'z': float(coords[j,2])},
+                                      'radius': atom_size*0.15, 'color': '#BBBBBB', 'opacity': 1.0})
+    # highlight atom
+    if highlight_atom_index is not None:
+        pos = coords[int(highlight_atom_index)]
+        view.addSphere({'center': {'x': float(pos[0]), 'y': float(pos[1]), 'z': float(pos[2])},
+                        'radius': atom_size*1.4, 'color': 'red', 'opacity': 1.0})
+        if show_poly and poly_neighbors:
+            for j in poly_neighbors:
+                view.addCylinder({'start': {'x': float(pos[0]), 'y': float(pos[1]), 'z': float(pos[2])},
+                                  'end': {'x': float(coords[j,0]), 'y': float(coords[j,1]), 'z': float(coords[j,2])},
+                                  'radius': atom_size*0.08, 'color': 'orange', 'opacity': 1.0})
+    view.setBackgroundColor('#ffffff')
+    view.zoomTo()
+    return view.show()
+
+# ---------------- analysis core ----------------
 def analyze_structure(structure, filename,
-                      normalize_by="bonds", dbscan_eps=DEFAULT_DBSCAN_EPS,
-                      dbscan_min_samples=DEFAULT_DBSCAN_MIN_SAMPLES,
-                      compute_soap=True, compute_mbtr=True, soap_first_n=DEFAULT_SOAP_N):
+                      per_pair_ranges=None,
+                      normalize_by="bonds", dbscan_eps=DEFAULT_DBSCAN_EPS, dbscan_min_samples=DEFAULT_DBSCAN_MIN_SAMPLES,
+                      compute_soap=True, compute_mbtr=True, soap_first_n=DEFAULT_SOAP_N,
+                      coeff_map=None):
     n_atoms = len(structure.sites)
     elements = [str(site.specie) for site in structure.sites]
     coords = np.array([site.coords for site in structure])
     z_coords = coords[:, 2]
 
-    # Layers mapping
+    # layer detection
     layer_indices = detect_layers(z_coords, eps=dbscan_eps, min_samples=dbscan_min_samples)
     layer_means = {l: np.mean(z_coords[layer_indices == l]) for l in np.unique(layer_indices)}
     label_map = {old: new for new, old in enumerate(sorted(layer_means, key=lambda L: layer_means[L]))}
@@ -125,7 +176,7 @@ def analyze_structure(structure, filename,
     n_layers = int(layer_indices.max()) + 1
     surface_mask = (layer_indices == layer_indices.min()) | (layer_indices == layer_indices.max())
 
-    # per-atom rows
+    # per-atom table
     atom_rows = [{
         "filename": filename,
         "atom_index": i,
@@ -136,7 +187,7 @@ def analyze_structure(structure, filename,
     } for i, c in enumerate(coords)]
     atom_df = pd.DataFrame(atom_rows)
 
-    # bond counts
+    # bond counting using per_pair_ranges if provided
     bond_counts_intra = defaultdict(int)
     bond_counts_inter = defaultdict(int)
     coordination = np.zeros(n_atoms)
@@ -144,24 +195,28 @@ def analyze_structure(structure, filename,
         neighs = find_neighbors_validated(structure, i)
         coordination[i] = len(neighs)
         for j in neighs:
-            if j <= i:
-                continue
+            if j <= i: continue
             e1, e2 = elements[i], elements[j]
-            pair = "-".join(sorted([e1, e2]))
+            pair_key = "-".join(sorted([e1, e2]))
             d = structure.get_distance(i, j)
-            cutoff = adaptive_bond_cutoff(e1, e2)
-            if d > cutoff * 1.05:
+            # determine cutoff from per_pair_ranges or adaptive
+            if per_pair_ranges and pair_key in per_pair_ranges:
+                min_r, max_r = per_pair_ranges[pair_key]
+            else:
+                min_r = 0.0
+                max_r = adaptive_bond_cutoff(e1, e2) * 1.12
+            if not (min_r <= d <= max_r): 
                 continue
             if layer_indices[i] == layer_indices[j]:
-                bond_counts_intra[pair] += 1
+                bond_counts_intra[pair_key] += 1
             else:
-                bond_counts_inter[pair] += 1
+                bond_counts_inter[pair_key] += 1
 
     surface_counts = defaultdict(int)
     for i, surf in enumerate(surface_mask):
-        if surf:
-            surface_counts[f"{elements[i]}-S"] += 1
+        if surf: surface_counts[f"{elements[i]}-S"] += 1
 
+    # standard descriptor keys
     x = {
         'Pt-S': surface_counts.get('Pt-S', 0),
         'Ru-S': surface_counts.get('Ru-S', 0),
@@ -177,8 +232,8 @@ def analyze_structure(structure, filename,
         "filename": filename,
         "n_atoms": n_atoms,
         "n_layers": n_layers,
-        "avg_coordination": float(np.mean(coordination)) if n_atoms > 0 else 0.0,
-        "surface_ratio": float(np.sum(surface_mask) / n_atoms) if n_atoms > 0 else 0.0,
+        "avg_coordination": float(np.mean(coordination)) if n_atoms>0 else 0.0,
+        "surface_ratio": float(np.sum(surface_mask) / n_atoms) if n_atoms>0 else 0.0,
         "total_bonds": int(total_bonds)
     }
     desc.update(x)
@@ -191,12 +246,14 @@ def analyze_structure(structure, filename,
         x_norm = {k: v / total_bonds for k, v in x.items()}
 
     # binding energy prediction
-    Y = COEFFICIENTS['b0'] + sum(COEFFICIENTS.get('b_' + k, 0) * x_norm.get(k, 0) for k in x_norm)
-    sigmaY = propagate_uncertainty_linear(COEFFICIENTS, x)
+    if coeff_map is None:
+        coeff_map = DEFAULT_COEFFICIENTS
+    Y = coeff_map.get('b0', 0.0) + sum(coeff_map.get('b_' + k, 0.0) * x_norm.get(k, 0.0) for k in x_norm)
+    sigmaY = propagate_uncertainty_linear(coeff_map, x)
     desc['Binding_Energy_eV'] = float(Y)
     desc['Binding_Energy_sigma_eV_approx'] = float(sigmaY)
 
-    # SOAP/MBTR
+    # SOAP + MBTR
     ase_atoms = structure_to_ase(structure)
     species = list(set(ase_atoms.get_chemical_symbols()))
 
@@ -208,7 +265,7 @@ def analyze_structure(structure, filename,
             for i, val in enumerate(soap_mean[:soap_first_n]):
                 desc[f"SOAP_{i}"] = float(val)
         except Exception as e:
-            st.warning(f"SOAP failed: {e}")
+            st.warning(f"SOAP failed for {filename}: {e}")
 
     if compute_mbtr:
         try:
@@ -223,192 +280,274 @@ def analyze_structure(structure, filename,
             desc["MBTR_mean"] = float(np.mean(mbtr_vec))
             desc["MBTR_std"] = float(np.std(mbtr_vec))
         except Exception as e:
-            st.warning(f"MBTR failed: {e}")
+            st.warning(f"MBTR failed for {filename}: {e}")
 
     return desc, atom_df
 
-# ------------------ 3D visualization ------------------
-def make_py3dmol_view(structure, show_bonds=True, bond_min=0.0, bond_max=3.0,
-                      highlight_atom_index=None, show_poly=False, poly_neighbors=None,
-                      atom_size=0.7):
-    """Return HTML of py3Dmol viewer for an ASE/molecule-like structure (uses pymatgen Structure)"""
-    atoms = structure
-    # feed as x,y,z + element
-    view = py3Dmol.view(width=700, height=500)
-    coords = np.array([s.coords for s in atoms.sites])
-    elements = [str(s.specie) for s in atoms.sites]
+# ---------------- UI: persistent session state helpers ----------------
+if 'pair_ranges' not in st.session_state:
+    st.session_state['pair_ranges'] = {}  # dict pair->(min,max)
+if 'coeff_map' not in st.session_state:
+    st.session_state['coeff_map'] = dict(DEFAULT_COEFFICIENTS)
+if 'presets' not in st.session_state:
+    st.session_state['presets'] = {}
 
-    # Add atoms
-    for i, (el, pos) in enumerate(zip(elements, coords)):
-        style = {"sphere": {"radius": atom_size}}
-        if highlight_atom_index is not None and i == highlight_atom_index:
-            view.addSphere({'center': {'x': float(pos[0]), 'y': float(pos[1]), 'z': float(pos[2])},
-                            'radius': atom_size * 1.4, 'color': 'red', 'opacity': 1.0})
-        view.addModel({"atoms": [{"elem": el, "x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2])} for _ in [0]]}, "sdf")
-        # simpler: add sphere by element color using built-in color scheme
-        view.addSphere({'center': {'x': float(pos[0]), 'y': float(pos[1]), 'z': float(pos[2])},
-                        'radius': atom_size, 'color': py3Dmol.elementColors.get(el.capitalize(), '#AAAAAA')})
+def save_preset(name):
+    st.session_state['presets'][name] = {
+        'pair_ranges': st.session_state['pair_ranges'],
+        'coeff_map': st.session_state['coeff_map']
+    }
 
-    # Add bonds (simple geometric)
-    if show_bonds:
-        n = len(elements)
-        for i in range(n):
-            for j in range(i+1, n):
-                d = structure.get_distance(i, j)
-                if bond_min <= d <= bond_max:
-                    view.addCylinder({'start': {'x': float(coords[i,0]), 'y': float(coords[i,1]), 'z': float(coords[i,2])},
-                                      'end': {'x': float(coords[j,0]), 'y': float(coords[j,1]), 'z': float(coords[j,2])},
-                                      'radius': atom_size*0.25, 'color': 'lightgrey', 'opacity': 1.0})
+def load_preset(name):
+    p = st.session_state['presets'][name]
+    st.session_state['pair_ranges'] = p.get('pair_ranges', {})
+    st.session_state['coeff_map'] = dict(p.get('coeff_map', DEFAULT_COEFFICIENTS))
 
-    # Polyhedron: draw lines from highlighted atom to neighbors
-    if show_poly and poly_neighbors is not None and highlight_atom_index is not None:
-        center = coords[highlight_atom_index]
-        for j in poly_neighbors:
-            view.addCylinder({'start': {'x': float(center[0]), 'y': float(center[1]), 'z': float(center[2])},
-                              'end': {'x': float(coords[j,0]), 'y': float(coords[j,1]), 'z': float(coords[j,2])},
-                              'radius': atom_size*0.12, 'color': 'orange', 'opacity': 1.0})
+# ---------------- UI layout ----------------
+st.title("🔬 Scientific Workstation — Ultimate (QSPR + SOAP + MBTR)")
 
-    view.setBackgroundColor('#ffffff')
-    view.zoomTo()
-    html = view.show()
-    return html
+# top-level tabs
+tab_view, tab_control, tab_descriptors, tab_presets = st.tabs(["Viewer", "Control Board", "Descriptors & Run", "Presets"])
 
-# ------------------ Streamlit UI layout ------------------
-st.markdown("<style> .big-font { font-size:22px; font-weight:600; } .muted { color:#6c757d } </style>", unsafe_allow_html=True)
-st.title("🔬 Scientific Workstation — QSPR + SOAP + MBTR")
+# ---------- Viewer tab ----------
+with tab_view:
+    st.header("3D Structure Viewer (first file preview)")
+    left, right = st.columns([2,1])
+    with left:
+        if st.file_uploader is None:
+            st.info("Upload in the Control Board tab.")
+        # preview area will be filled by Control Board when files uploaded
+        viewer_placeholder = st.empty()
+    with right:
+        st.markdown("**Viewer Controls**")
+        v_show_bonds = st.checkbox("Show bonds (viewer)", value=True, key="v_show_bonds")
+        v_bond_min = st.number_input("Viewer min bond (Å)", value=0.0, step=0.01, key="v_bond_min")
+        v_bond_max = st.number_input("Viewer max bond (Å)", value=3.0, step=0.01, key="v_bond_max")
+        v_show_poly = st.checkbox("Show coordination polyhedra (viewer)", value=False, key="v_show_poly")
+        v_atom_index = st.number_input("Highlight atom index (0-based, viewer)", value=0, min_value=0, step=1, key="v_atom_index")
+        st.markdown("---")
+        st.write("Quick exports:")
+        st.button("Screenshot view (not implemented)", disabled=True)
 
-# Sidebar: upload + settings
-with st.sidebar:
-    st.header("Input & Viewer Settings")
-    uploaded = st.file_uploader("Upload CIF files", type=["cif"], accept_multiple_files=True)
-    st.markdown("---")
-    st.subheader("Bond search")
-    element_filter_toggle = st.checkbox("Limit pairs by element selection", value=False)
-    min_bond = st.number_input("Min bond length (Å)", value=0.0, step=0.05, format="%.2f")
-    max_bond = st.number_input("Max bond length (Å)", value=3.0, step=0.05, format="%.2f")
-    show_bonds = st.checkbox("Show bonds", value=True)
-    show_poly = st.checkbox("Show coordination polyhedra", value=False)
-    dbscan_eps = st.number_input("DBSCAN eps (layer detect)", value=float(DEFAULT_DBSCAN_EPS), step=0.01, format="%.3f")
-    dbscan_min = st.number_input("DBSCAN min_samples", value=int(DEFAULT_DBSCAN_MIN_SAMPLES), min_value=1, step=1)
+# ---------- Control Board ----------
+with tab_control:
+    st.header("Control Board — upload files & global settings")
+    col1, col2 = st.columns([2,1])
+    with col1:
+        uploaded = st.file_uploader("Upload CIF(s) — multiple OK", type=["cif"], accept_multiple_files=True)
+        st.markdown("**File list:**")
+        if uploaded:
+            for idx, f in enumerate(uploaded):
+                st.write(f"{idx+1}. {f.name} — {round(len(f.getbuffer())/1024,1)} KB")
+    with col2:
+        st.subheader("Global Analysis Settings")
+        normalize_by = st.selectbox("Normalization for descriptors", options=["bonds","atoms","none"], index=0)
+        compute_soap = st.checkbox("Compute SOAP (slow)", value=True)
+        compute_mbtr = st.checkbox("Compute MBTR (slow)", value=True)
+        soap_n = st.number_input("Keep first N SOAP features", min_value=10, max_value=1000, value=50)
+        dbscan_eps = st.number_input("DBSCAN eps (layers)", value=0.25, step=0.01)
+        dbscan_min = st.number_input("DBSCAN min_samples", value=1, step=1, min_value=1)
+        st.markdown("**Per-pair bond controls**")
+        st.markdown("You can set per pair min/max bond lengths. If blank, uses adaptive covalent estimates.")
+        if st.button("Auto-detect element pairs from uploaded files"):
+            # build pair set
+            all_elements = set()
+            if not uploaded:
+                st.warning("Upload files first")
+            else:
+                for f in uploaded:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".cif") as tmp:
+                        tmp.write(f.getbuffer()); tmp.flush(); p = tmp.name
+                    try:
+                        s = Structure.from_file(p)
+                        all_elements.update([str(site.specie) for site in s.sites])
+                    finally:
+                        try: os.remove(p)
+                        except: pass
+                all_elements = sorted(all_elements)
+                pairs = []
+                for i, e1 in enumerate(all_elements):
+                    for e2 in all_elements[i:]:
+                        pairs.append("-".join(sorted([e1, e2])))
+                # initialize pair ranges in session if missing
+                for pair in pairs:
+                    if pair not in st.session_state['pair_ranges']:
+                        # default min=0, max adaptive from radii
+                        parts = pair.split('-')
+                        est = adaptive_bond_cutoff(parts[0], parts[1])
+                        st.session_state['pair_ranges'][pair] = (0.0, round(est*1.12,3))
+                st.success(f"Detected element pairs: {len(pairs)}")
+                st.experimental_rerun()
 
-    st.markdown("---")
-    st.subheader("Descriptors")
-    normalize_by = st.selectbox("Normalize descriptors by", options=["bonds","atoms","none"], index=0)
-    compute_soap = st.checkbox("Compute SOAP", value=True)
-    compute_mbtr = st.checkbox("Compute MBTR", value=True)
-    soap_n = st.number_input("Keep first N SOAP features", min_value=10, max_value=1000, value=50, step=10)
-    run_button = st.button("Run analysis on uploaded files")
-
-# Main columns
-col_left, col_right = st.columns([1.2, 1])
-
-if uploaded:
-    # Parse first file for preview & element list
-    first = uploaded[0]
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".cif") as tmp:
-            tmp.write(first.getbuffer())
-            tmp.flush()
-            tmp_path = tmp.name
-        struct_preview = Structure.from_file(tmp_path)
-        elements_unique = sorted(list(set([str(s.specie) for s in struct_preview.sites])))
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
-    # element selectors for restricted bond search
-    if element_filter_toggle:
-        a1 = st.sidebar.selectbox("Atom A1 (element)", options=elements_unique, index=0)
-        a2 = st.sidebar.selectbox("Atom A2 (element)", options=elements_unique, index=0)
-    else:
-        a1 = a2 = None
-
-    # viewer interactive controls
-    with col_left:
-        st.subheader("3D Structure Viewer")
-        viewer_holder = st.empty()
-        try:
-            html = make_py3dmol_view(struct_preview, show_bonds=show_bonds, bond_min=min_bond, bond_max=max_bond,
-                                     highlight_atom_index=None, show_poly=show_poly, poly_neighbors=None)
-            viewer_holder.components.v1.html(html, height=520, scrolling=True)
-        except Exception as e:
-            st.error(f"Viewer failed: {e}")
-
-    with col_right:
-        st.subheader("Structure details")
-        st.write(f"File: **{first.name}**")
-        st.write(f"Atoms: **{len(struct_preview.sites)}**  — Elements: {', '.join(elements_unique)}")
-        st.write("Select an atom index to highlight & inspect neighbors:")
-        atom_index = st.number_input("Highlight atom index (0-based)", min_value=0, max_value=max(0,len(struct_preview.sites)-1), value=0, step=1)
-        if st.button("Highlight & show neighbors"):
-            neighs = find_neighbors_validated(struct_preview, int(atom_index))
-            html2 = make_py3dmol_view(struct_preview, show_bonds=show_bonds, bond_min=min_bond, bond_max=max_bond,
-                                      highlight_atom_index=int(atom_index), show_poly=show_poly, poly_neighbors=neighs)
-            viewer_holder.components.v1.html(html2, height=520, scrolling=True)
-            st.write("Neighbors indices:", neighs)
-
-else:
-    st.info("Upload one or more CIF files in the sidebar to start. Viewer shows the first file as preview.")
-
-# Run analysis when requested
-if run_button:
-    if not uploaded:
-        st.warning("Please upload CIF files before running.")
-    else:
-        st.info("Processing files — SOAP/MBTR can be slow for many structures.")
-        progress = st.progress(0)
-        desc_list = []
-        atom_tables = []
-        n_files = len(uploaded)
-        for i, up in enumerate(uploaded):
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".cif") as tmp:
-                    tmp.write(up.getbuffer())
-                    tmp.flush()
-                    path = tmp.name
-                s = Structure.from_file(path)
-                desc, atom_df = analyze_structure(
-                    s, up.name,
-                    normalize_by=normalize_by,
-                    dbscan_eps=dbscan_eps,
-                    dbscan_min_samples=dbscan_min,
-                    compute_soap=compute_soap,
-                    compute_mbtr=compute_mbtr,
-                    soap_first_n=int(soap_n)
-                )
-                desc_list.append(desc)
-                atom_tables.append(atom_df)
-            except Exception as e:
-                st.error(f"Error processing {up.name}: {e}")
-            finally:
+        st.markdown("Per-pair editor (editable):")
+        # show editable DataFrame for pairs
+        pr = st.session_state['pair_ranges']
+        if pr:
+            df_pairs = pd.DataFrame([
+                {"pair": k, "min": float(v[0]), "max": float(v[1])}
+                for k, v in sorted(pr.items())
+            ])
+            edited = st.experimental_data_editor(df_pairs, num_rows="dynamic")
+            # write back to session_state
+            new_map = {}
+            for r in edited.to_dict(orient='records'):
                 try:
-                    os.remove(path)
+                    mn = float(r['min']); mx = float(r['max'])
                 except Exception:
-                    pass
-            progress.progress(int((i+1)/n_files*100))
+                    mn = 0.0; mx = float(pr.get(r['pair'], (0.0, BOND_LENGTH_FALLBACK))[1])
+                new_map[r['pair']] = (mn, mx)
+            st.session_state['pair_ranges'] = new_map
+        else:
+            st.info("No pairs detected yet. Click 'Auto-detect element pairs' after uploading CIFs.")
 
-        if desc_list:
-            df_desc = pd.DataFrame(desc_list)
-            df_atoms = pd.concat(atom_tables, ignore_index=True)
-            st.success("Processing complete — results below.")
+# ---------- Descriptor / run tab ----------
+with tab_descriptors:
+    st.header("Descriptors & Run")
+    st.subheader("COEFFICIENTS editor (manually edit + save/load)")
+    # coefficients editor
+    coeff_df = pd.DataFrame([{"name": k, "value": float(v)} for k, v in st.session_state['coeff_map'].items()])
+    edited_coeff = st.experimental_data_editor(coeff_df, num_rows="dynamic")
+    # write back
+    new_coeff = {}
+    for row in edited_coeff.to_dict(orient='records'):
+        new_coeff[str(row['name'])] = float(row['value'])
+    st.session_state['coeff_map'] = new_coeff
 
-            st.subheader("Descriptor table (sample)")
-            st.dataframe(df_desc.head(10), use_container_width=True)
-            csv1 = df_desc.to_csv(index=False).encode('utf-8')
-            st.download_button("Download descriptors CSV", data=csv1, file_name="QSPR_SOAP_MBTR_descriptors.csv", mime="text/csv")
+    colA, colB = st.columns([1,1])
+    with colA:
+        run_button = st.button("Run full analysis (all uploaded files)")
+    with colB:
+        download_preset_btn = st.button("Save current preset as 'last_preset'")
 
-            st.subheader("Per-atom table (sample)")
-            st.dataframe(df_atoms.head(12), use_container_width=True)
-            csv2 = df_atoms.to_csv(index=False).encode('utf-8')
-            st.download_button("Download per-atom CSV", data=csv2, file_name="PerAtom_layers_enhanced.csv", mime="text/csv")
+    if download_preset_btn:
+        save_preset("last_preset")
+        st.success("Saved preset as 'last_preset'.")
 
-            st.markdown("---")
-            st.subheader("Basic plots")
-            if "Binding_Energy_eV" in df_desc.columns:
-                st.bar_chart(df_desc["Binding_Energy_eV"])
+    if run_button:
+        if not uploaded:
+            st.warning("Upload CIFs first in Control Board.")
+        else:
+            # processing loop
+            n = len(uploaded)
+            progress = st.progress(0)
+            results = []
+            atom_tables = []
+            for i, f in enumerate(uploaded):
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".cif") as tmp:
+                        tmp.write(f.getbuffer()); tmp.flush(); p = tmp.name
+                    s = Structure.from_file(p)
+                    desc, atom_df = analyze_structure(
+                        s, f.name,
+                        per_pair_ranges=st.session_state['pair_ranges'],
+                        normalize_by=normalize_by,
+                        dbscan_eps=dbscan_eps,
+                        dbscan_min_samples=dbscan_min,
+                        compute_soap=compute_soap,
+                        compute_mbtr=compute_mbtr,
+                        soap_first_n=int(soap_n),
+                        coeff_map=st.session_state['coeff_map']
+                    )
+                    results.append(desc)
+                    atom_tables.append(atom_df)
+                except Exception as e:
+                    st.error(f"Error processing {f.name}: {e}")
+                finally:
+                    try: os.remove(p)
+                    except: pass
+                progress.progress(int((i+1)/n*100))
 
-            st.write("Summary statistics:")
-            st.write(df_desc.describe(include='all'))
+            if results:
+                df_desc = pd.DataFrame(results)
+                df_atoms = pd.concat(atom_tables, ignore_index=True)
+                st.success("Analysis finished.")
+                st.subheader("Descriptor results (preview)")
+                st.dataframe(df_desc.head(15), use_container_width=True)
+                coldl1, coldl2 = st.columns(2)
+                with coldl1:
+                    st.download_button("Download descriptors CSV", data=df_desc.to_csv(index=False).encode('utf-8'),
+                                       file_name="QSPR_SOAP_MBTR_descriptors.csv", mime='text/csv')
+                with coldl2:
+                    # Excel export, both sheets
+                    towrite = io.BytesIO()
+                    with pd.ExcelWriter(towrite, engine='xlsxwriter') as writer:
+                        df_desc.to_excel(writer, sheet_name='descriptors', index=False)
+                        df_atoms.to_excel(writer, sheet_name='per_atom', index=False)
+                    towrite.seek(0)
+                    st.download_button("Download Excel workbook", data=towrite, file_name="results.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+                st.subheader("Basic plots")
+                if "Binding_Energy_eV" in df_desc.columns:
+                    st.bar_chart(df_desc["Binding_Energy_eV"])
+
+                # create zip of outputs
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "w") as zf:
+                    zf.writestr("descriptors.csv", df_desc.to_csv(index=False))
+                    zf.writestr("per_atom.csv", df_atoms.to_csv(index=False))
+                zip_buf.seek(0)
+                st.download_button("Download ZIP (CSV files)", data=zip_buf, file_name="results_csvs.zip", mime="application/zip")
+
+# ---------- Presets tab ----------
+with tab_presets:
+    st.header("Presets: save/load pair/coeff configurations")
+    name = st.text_input("Preset name", value="my_preset")
+    c1, c2 = st.columns([1,1])
+    with c1:
+        if st.button("Save preset"):
+            save_preset(name)
+            st.success(f"Saved preset '{name}'.")
+    with c2:
+        presets = list(st.session_state['presets'].keys())
+        if presets:
+            sel = st.selectbox("Load preset", options=presets)
+            if st.button("Load selected preset"):
+                load_preset(sel)
+                st.success(f"Loaded preset '{sel}'.")
+        else:
+            st.info("No presets saved yet.")
+    st.markdown("### Export / Import presets (JSON)")
+    colx, coly = st.columns([1,1])
+    with colx:
+        if st.button("Export presets as JSON"):
+            st.download_button("Download presets JSON", data=json.dumps(st.session_state['presets'], indent=2),
+                               file_name="qspr_presets.json", mime="application/json")
+    with coly:
+        up = st.file_uploader("Import presets JSON", type=["json"])
+        if up:
+            try:
+                p = json.loads(up.getvalue().decode())
+                st.session_state['presets'].update(p)
+                st.success("Imported presets.")
+            except Exception as e:
+                st.error(f"Import failed: {e}")
+
+# ---------- update viewer preview when files present ----------
+def update_preview():
+    if uploaded:
+        # preview first file
+        f = uploaded[0]
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".cif") as tmp:
+                tmp.write(f.getbuffer()); tmp.flush(); path = tmp.name
+            s0 = Structure.from_file(path)
+            # viewer html
+            html = make_py3dmol_view(s0,
+                                     show_bonds=st.session_state.get('v_show_bonds', True),
+                                     bond_min=st.session_state.get('v_bond_min', 0.0),
+                                     bond_max=st.session_state.get('v_bond_max', 3.0),
+                                     highlight_atom_index=st.session_state.get('v_atom_index', 0),
+                                     show_poly=st.session_state.get('v_show_poly', False))
+            viewer_placeholder.components.v1.html(html, height=520, scrolling=True)
+        except Exception as e:
+            viewer_placeholder.error(f"Viewer failed: {e}")
+        finally:
+            try: os.remove(path)
+            except: pass
+
+# run preview
+update_preview()
+
+st.sidebar.markdown("---")
+st.sidebar.write("Scientific Workstation • Multi-file • Per-pair controls • Editable coefficients")
+st.sidebar.write("Built for scientist-grade control. Save presets to reuse configurations.")
