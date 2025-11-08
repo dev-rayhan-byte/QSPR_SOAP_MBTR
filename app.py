@@ -33,7 +33,7 @@ import py3Dmol
 
 # ---------------- page config ----------------
 st.set_page_config(page_title="Scientific Workstation — Ultimate", layout="wide", initial_sidebar_state="expanded")
-st.markdown("<style>footer {visibility: hidden;} .stApp { background-color: #f8fafc; }</style>", unsafe_allow_html=True)
+st.markdown("", unsafe_allow_html=True)
 
 # ---------------- defaults ----------------
 BOND_LENGTH_FALLBACK = 3.2
