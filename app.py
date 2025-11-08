@@ -157,7 +157,8 @@ def make_py3dmol_html(structure: Structure, show_bonds=True, bond_min=0.0, bond_
 
 
 # ---------------- core analysis ----------------
-@st.cache_data(show_spinner=False)
+# NOTE: Structure is not hashable. Tell Streamlit to skip hashing Structure objects.
+@st.cache_data(show_spinner=False, hash_funcs={Structure: lambda _: None})
 def compute_descriptors_for_structure(structure: Structure, filename: str,
                                      per_pair_ranges: Dict[str, Tuple[float,float]],
                                      normalize_by: str = 'bonds',
@@ -537,5 +538,3 @@ st.sidebar.write('Multi-file, element-agnostic QSPR + SOAP + MBTR tool')
 st.sidebar.write('Tip: detect elements after uploading CIFs, then edit per-pair ranges.')
 
 # ---------------- End ----------------
-
-
