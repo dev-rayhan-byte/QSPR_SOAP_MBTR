@@ -396,7 +396,7 @@ with tab_control:
                 for i, e1 in enumerate(all_elements):
                     for e2 in all_elements[i:]:
                         pairs.append("-".join(sorted([e1, e2])))
-              # initialize pair ranges in session if missing
+ # initialize pair ranges in session if missing
 for pair in pairs:
     if pair not in st.session_state['pair_ranges']:
         parts = pair.split('-')
@@ -445,6 +445,7 @@ if pr:
 
 else:
     st.info("No pairs detected yet. Click 'Auto-detect element pairs' after uploading CIFs.")
+
 
 # ---------- Descriptor / run tab ----------
 with tab_descriptors:
