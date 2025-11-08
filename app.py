@@ -396,7 +396,7 @@ with tab_control:
                 for i, e1 in enumerate(all_elements):
                     for e2 in all_elements[i:]:
                         pairs.append("-".join(sorted([e1, e2])))
-               # initialize pair ranges in session if missing
+              # initialize pair ranges in session if missing
 for pair in pairs:
     if pair not in st.session_state['pair_ranges']:
         parts = pair.split('-')
@@ -416,35 +416,35 @@ else:
 
 st.markdown("Per-pair editor (editable):")
 
-        # show editable DataFrame for pairs
-        pr = st.session_state['pair_ranges']
-        
-        if pr:
-            df_pairs = pd.DataFrame([
-                {"pair": k, "min": float(v[0]), "max": float(v[1])}
-                for k, v in sorted(pr.items())
-            ])
-        
-            # ✅ Use st.data_editor instead of deprecated version
-            edited = st.data_editor(df_pairs, num_rows="dynamic")
-        
-            # write back to session_state
-            new_map = {}
-            for r in edited.to_dict(orient='records'):
-                try:
-                    mn = float(r["min"])
-                    mx = float(r["max"])
-                except Exception:
-                    # fallback on previous values
-                    old = pr.get(r["pair"], (0.0, BOND_LENGTH_FALLBACK))
-                    mn, mx = old
-        
-                new_map[r["pair"]] = (mn, mx)
-        
-            st.session_state['pair_ranges'] = new_map
-        
-        else:
-            st.info("No pairs detected yet. Click 'Auto-detect element pairs' after uploading CIFs.")
+# show editable DataFrame for pairs
+pr = st.session_state['pair_ranges']
+
+if pr:
+    df_pairs = pd.DataFrame([
+        {"pair": k, "min": float(v[0]), "max": float(v[1])}
+        for k, v in sorted(pr.items())
+    ])
+
+    # ✅ Use st.data_editor instead of deprecated version
+    edited = st.data_editor(df_pairs, num_rows="dynamic")
+
+    # write back to session_state
+    new_map = {}
+    for r in edited.to_dict(orient='records'):
+        try:
+            mn = float(r["min"])
+            mx = float(r["max"])
+        except Exception:
+            # fallback on previous values
+            old = pr.get(r["pair"], (0.0, BOND_LENGTH_FALLBACK))
+            mn, mx = old
+
+        new_map[r["pair"]] = (mn, mx)
+
+    st.session_state['pair_ranges'] = new_map
+
+else:
+    st.info("No pairs detected yet. Click 'Auto-detect element pairs' after uploading CIFs.")
 
 # ---------- Descriptor / run tab ----------
 with tab_descriptors:
