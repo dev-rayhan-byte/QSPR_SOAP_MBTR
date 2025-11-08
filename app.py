@@ -432,7 +432,7 @@ with tab_descriptors:
     st.subheader("COEFFICIENTS editor (manually edit + save/load)")
     # coefficients editor
     coeff_df = pd.DataFrame([{"name": k, "value": float(v)} for k, v in st.session_state['coeff_map'].items()])
-    edited_coeff = st.experimental_data_editor(coeff_df, num_rows="dynamic")
+    edited_coeff = st.data_editor(coeff_df, num_rows="dynamic")
     # write back
     new_coeff = {}
     for row in edited_coeff.to_dict(orient='records'):
