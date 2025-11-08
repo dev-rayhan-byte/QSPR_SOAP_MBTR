@@ -7,3 +7,4 @@ numpy>=1.26
 pandas>=2.2
 tqdm>=4.66
 py3Dmol>=1.8.0
+xlsxwriter>=3.1.0
